@@ -1,6 +1,5 @@
-opencv-python
-mediapipe
-numpy
-matplotlib
-reportlab
 streamlit
+opencv-python-headless
+numpy
+pandas
+Pillow
