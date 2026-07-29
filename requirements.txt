@@ -1,6 +1,6 @@
-opencv-python
+streamlit
 mediapipe
 numpy
 matplotlib
 reportlab
-streamlit
+opencv-python-headless
