@@ -1,6 +1,5 @@
 streamlit
-opencv-python-headless==4.10.0.84
-mediapipe==0.10.21
-numpy==1.26.4
+mediapipe
+numpy
 pillow
 reportlab
