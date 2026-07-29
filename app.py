@@ -1,19 +1,15 @@
-import cv2
-import mediapipe as mp
-import numpy as np
 import os
-import time
+import io
+import cv2
+import numpy as np
 import streamlit as st
+import mediapipe as mp
 
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
-from analysis import (
-    calculate_smile_asymmetry,
-    calculate_face_symmetry
-)
-
-from report_generator import generate_report
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 
 
 # ============================================================
@@ -31,9 +27,7 @@ st.set_page_config(
 # TITLE
 # ============================================================
 
-st.title(
-    "SmileInsight"
-)
+st.title("😊 SmileInsight")
 
 st.subheader(
     "AI-Assisted Facial Smile Asymmetry Analysis System"
@@ -47,11 +41,15 @@ st.warning(
 
 
 # ============================================================
-# MODEL
+# MODEL PATH
 # ============================================================
 
-MODEL_PATH = (
-    "models/face_landmarker.task"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+MODEL_PATH = os.path.join(
+    BASE_DIR,
+    "models",
+    "face_landmarker.task"
 )
 
 
@@ -65,15 +63,26 @@ if not os.path.exists(MODEL_PATH):
         "Face Landmarker model not found."
     )
 
+    st.write(
+        "Expected model location:"
+    )
+
+    st.code(MODEL_PATH)
+
+    st.info(
+        "Please place face_landmarker.task inside the "
+        "models folder in your GitHub repository."
+    )
+
     st.stop()
 
 
 # ============================================================
-# CREATE MEDIAPIPE
+# LOAD MEDIAPIPE FACE LANDMARKER
 # ============================================================
 
 @st.cache_resource
-def load_landmarker():
+def load_face_landmarker():
 
     base_options = python.BaseOptions(
         model_asset_path=MODEL_PATH
@@ -88,74 +97,51 @@ def load_landmarker():
         min_tracking_confidence=0.5
     )
 
-    return vision.FaceLandmarker.create_from_options(
+    detector = vision.FaceLandmarker.create_from_options(
         options
     )
 
-
-landmarker = load_landmarker()
-
-
-# ============================================================
-# SESSION STATE
-# ============================================================
-
-if "neutral_landmarks" not in st.session_state:
-
-    st.session_state.neutral_landmarks = None
+    return detector
 
 
-if "smile_landmarks" not in st.session_state:
+try:
 
-    st.session_state.smile_landmarks = None
+    landmarker = load_face_landmarker()
 
+except Exception as e:
 
-if "analysis_result" not in st.session_state:
+    st.error(
+        "Unable to load the Face Landmarker model."
+    )
 
-    st.session_state.analysis_result = None
+    st.exception(e)
 
-
-# ============================================================
-# SIDEBAR
-# ============================================================
-
-st.sidebar.header(
-    "Analysis Controls"
-)
-
-patient_id = st.sidebar.text_input(
-    "Patient / Subject ID",
-    value="SI-001"
-)
+    st.stop()
 
 
 # ============================================================
 # CAMERA INPUT
 # ============================================================
 
-st.header(
-    "Step 1: Capture Facial Images"
-)
+st.header("📷 Smile Analysis")
 
 st.write(
-    "Look directly at the laptop camera."
+    "Allow camera access when your browser asks for permission. "
+    "Look directly at the camera and smile naturally."
 )
 
 camera_image = st.camera_input(
-    "Take a facial image"
+    "Take a photo using your laptop camera"
 )
 
 
 # ============================================================
-# PROCESS IMAGE
+# ANALYSIS FUNCTION
 # ============================================================
 
-if camera_image is not None:
+def analyze_smile(image_bytes):
 
-    # Read image bytes
-    image_bytes = camera_image.getvalue()
-
-    # Convert bytes to NumPy
+    # Convert uploaded image to NumPy array
     image_array = np.frombuffer(
         image_bytes,
         dtype=np.uint8
@@ -167,13 +153,17 @@ if camera_image is not None:
         cv2.IMREAD_COLOR
     )
 
+    if frame is None:
+
+        return None, None
+
     # Convert BGR to RGB
     rgb_frame = cv2.cvtColor(
         frame,
         cv2.COLOR_BGR2RGB
     )
 
-    # Create MediaPipe Image
+    # Create MediaPipe image
     mp_image = mp.Image(
         image_format=mp.ImageFormat.SRGB,
         data=rgb_frame
@@ -184,258 +174,440 @@ if camera_image is not None:
         mp_image
     )
 
-    if result.face_landmarks:
+    if not result.face_landmarks:
 
-        # Get first face
-        face_landmarks = result.face_landmarks[0]
+        return None, None
 
-        # Convert landmarks to NumPy
-        landmarks = np.array(
-            [
-                [
-                    landmark.x,
-                    landmark.y,
-                    landmark.z
-                ]
+    landmarks = result.face_landmarks[0]
 
-                for landmark in face_landmarks
-            ]
+    height, width, _ = frame.shape
+
+    # Convert normalized landmarks to pixel coordinates
+    points = []
+
+    for landmark in landmarks:
+
+        x = int(
+            landmark.x * width
         )
 
-        st.success(
-            "Face detected successfully."
+        y = int(
+            landmark.y * height
         )
 
-        # Display image
-        st.image(
-            rgb_frame,
-            caption="Captured Facial Image"
+        points.append(
+            (x, y)
         )
 
-        # -----------------------------------------------------
-        # CAPTURE BUTTONS
-        # -----------------------------------------------------
+    # ========================================================
+    # IMPORTANT FACIAL LANDMARKS
+    # ========================================================
+    #
+    # MediaPipe Face Mesh landmark indexes
+    #
+    # 61  = Left mouth corner
+    # 291 = Right mouth corner
+    # 13  = Upper lip center
+    # 14  = Lower lip center
+    #
+    # These are used to estimate smile geometry.
+    #
 
-        col1, col2 = st.columns(2)
+    left_corner = points[61]
 
+    right_corner = points[291]
 
-        with col1:
+    upper_lip = points[13]
 
-            if st.button(
-                "Capture Neutral Face"
-            ):
+    lower_lip = points[14]
 
-                st.session_state.neutral_landmarks = (
-                    landmarks
-                )
+    # Face center based on mouth corners
+    face_center_x = (
+        left_corner[0] +
+        right_corner[0]
+    ) / 2
 
-                st.success(
-                    "Neutral face captured."
-                )
+    # Calculate mouth corner vertical distances
+    left_vertical = abs(
+        left_corner[1] -
+        upper_lip[1]
+    )
 
+    right_vertical = abs(
+        right_corner[1] -
+        upper_lip[1]
+    )
 
-        with col2:
+    # Avoid division by zero
+    denominator = max(
+        left_vertical +
+        right_vertical,
+        1
+    )
 
-            if st.button(
-                "Capture Smile"
-            ):
+    # Calculate asymmetry percentage
+    asymmetry = (
+        abs(
+            left_vertical -
+            right_vertical
+        )
+        /
+        denominator
+    ) * 100
 
-                st.session_state.smile_landmarks = (
-                    landmarks
-                )
+    # Limit to 100
+    asymmetry = min(
+        asymmetry,
+        100
+    )
 
-                st.success(
-                    "Smile captured."
-                )
+    # Determine dominant side
+    if left_vertical > right_vertical:
 
+        dominant_side = "Left side"
+
+    elif right_vertical > left_vertical:
+
+        dominant_side = "Right side"
 
     else:
 
-        st.error(
-            "No face detected. Please look directly at the camera."
-        )
+        dominant_side = "Balanced"
+
+    # ========================================================
+    # DRAW LANDMARKS
+    # ========================================================
+
+    output_image = frame.copy()
+
+    # Draw mouth landmarks
+    cv2.circle(
+        output_image,
+        left_corner,
+        8,
+        (0, 255, 0),
+        -1
+    )
+
+    cv2.circle(
+        output_image,
+        right_corner,
+        8,
+        (0, 255, 0),
+        -1
+    )
+
+    cv2.circle(
+        output_image,
+        upper_lip,
+        8,
+        (255, 0, 0),
+        -1
+    )
+
+    cv2.circle(
+        output_image,
+        lower_lip,
+        8,
+        (255, 0, 0),
+        -1
+    )
+
+    # Draw mouth line
+    cv2.line(
+        output_image,
+        left_corner,
+        right_corner,
+        (0, 255, 255),
+        3
+    )
+
+    # Add text
+    cv2.putText(
+        output_image,
+        f"Asymmetry: {asymmetry:.2f}%",
+        (30, 50),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1,
+        (0, 255, 0),
+        2
+    )
+
+    return output_image, {
+        "asymmetry": asymmetry,
+        "dominant_side": dominant_side,
+        "left_vertical": left_vertical,
+        "right_vertical": right_vertical
+    }
 
 
 # ============================================================
-# ANALYSIS
+# PDF REPORT GENERATOR
 # ============================================================
 
-st.header(
-    "Step 2: Perform Smile Asymmetry Analysis"
-)
-
-
-if (
-
-    st.session_state.neutral_landmarks is not None
-
-    and
-
-    st.session_state.smile_landmarks is not None
-
+def generate_pdf(
+    asymmetry,
+    dominant_side
 ):
 
-    if st.button(
-        "Analyze Smile Asymmetry"
-    ):
+    buffer = io.BytesIO()
 
-        neutral = (
-            st.session_state.neutral_landmarks
+    pdf = canvas.Canvas(
+        buffer,
+        pagesize=A4
+    )
+
+    width, height = A4
+
+    # Title
+    pdf.setFont(
+        "Helvetica-Bold",
+        20
+    )
+
+    pdf.drawString(
+        50,
+        height - 60,
+        "SmileInsight Analysis Report"
+    )
+
+    # Subtitle
+    pdf.setFont(
+        "Helvetica",
+        12
+    )
+
+    pdf.drawString(
+        50,
+        height - 90,
+        "AI-Assisted Facial Smile Asymmetry Analysis"
+    )
+
+    # Line
+    pdf.line(
+        50,
+        height - 105,
+        width - 50,
+        height - 105
+    )
+
+    # Results
+    pdf.setFont(
+        "Helvetica-Bold",
+        14
+    )
+
+    pdf.drawString(
+        50,
+        height - 150,
+        "Analysis Results"
+    )
+
+    pdf.setFont(
+        "Helvetica",
+        12
+    )
+
+    pdf.drawString(
+        50,
+        height - 185,
+        f"Smile Asymmetry Score: {asymmetry:.2f}%"
+    )
+
+    pdf.drawString(
+        50,
+        height - 215,
+        f"Dominant Asymmetric Side: {dominant_side}"
+    )
+
+    # Interpretation
+    pdf.setFont(
+        "Helvetica-Bold",
+        14
+    )
+
+    pdf.drawString(
+        50,
+        height - 270,
+        "Interpretation"
+    )
+
+    pdf.setFont(
+        "Helvetica",
+        11
+    )
+
+    if asymmetry < 5:
+
+        interpretation = (
+            "The measured smile geometry appears relatively balanced."
         )
 
-        smile = (
-            st.session_state.smile_landmarks
+    elif asymmetry < 15:
+
+        interpretation = (
+            "A mild geometric difference between the two sides "
+            "of the smile was observed."
         )
 
-        # Estimate face width
-        face_width = abs(
-            neutral[454][0] -
-            neutral[234][0]
+    else:
+
+        interpretation = (
+            "A noticeable geometric difference between the two "
+            "sides of the smile was observed."
         )
 
-        # Calculate smile asymmetry
-        smile_result = calculate_smile_asymmetry(
-            neutral,
-            smile,
-            face_width
-        )
+    pdf.drawString(
+        50,
+        height - 300,
+        interpretation
+    )
 
-        # Calculate facial symmetry
-        face_symmetry = calculate_face_symmetry(
-            neutral
-        )
+    # Disclaimer
+    pdf.setFont(
+        "Helvetica-Oblique",
+        9
+    )
 
-        st.session_state.analysis_result = {
+    pdf.drawString(
+        50,
+        100,
+        "This report is intended for research and educational purposes."
+    )
 
-            "smile": smile_result,
+    pdf.drawString(
+        50,
+        85,
+        "It is not a medical diagnosis or clinical assessment."
+    )
 
-            "face_symmetry":
-                face_symmetry
-        }
+    pdf.save()
+
+    buffer.seek(0)
+
+    return buffer
 
 
 # ============================================================
-# DISPLAY RESULTS
+# PROCESS CAMERA IMAGE
 # ============================================================
 
-if st.session_state.analysis_result:
-
-    result = (
-        st.session_state.analysis_result
-    )
-
-    smile = result["smile"]
-
-    face_symmetry = (
-        result["face_symmetry"]
-    )
-
-
-    st.header(
-        "Step 3: Analysis Results"
-    )
-
-
-    # ---------------------------------------------------------
-    # METRICS
-    # ---------------------------------------------------------
-
-    col1, col2, col3 = st.columns(3)
-
-
-    with col1:
-
-        st.metric(
-            "Left Smile Movement",
-            f"{smile['left_movement']:.4f}"
-        )
-
-
-    with col2:
-
-        st.metric(
-            "Right Smile Movement",
-            f"{smile['right_movement']:.4f}"
-        )
-
-
-    with col3:
-
-        st.metric(
-            "Smile Asymmetry",
-            f"{smile['asymmetry_index']:.2f}%"
-        )
-
-
-    st.subheader(
-        "Geometric Classification"
-    )
+if camera_image is not None:
 
     st.info(
-        smile["classification"]
+        "Analyzing your facial landmarks..."
     )
 
+    try:
 
-    # ---------------------------------------------------------
-    # FACE SYMMETRY
-    # ---------------------------------------------------------
-
-    st.subheader(
-        "Facial Symmetry Deviation"
-    )
-
-    st.write(
-        f"{face_symmetry:.2f}%"
-    )
-
-
-    # ---------------------------------------------------------
-    # GENERATE PDF
-    # ---------------------------------------------------------
-
-    if st.button(
-        "Generate PDF Report"
-    ):
-
-        os.makedirs(
-            "reports",
-            exist_ok=True
+        result_image, analysis = analyze_smile(
+            camera_image.getvalue()
         )
 
-        filename = (
-            f"reports/"
-            f"SmileInsight_{patient_id}.pdf"
-        )
+        # ====================================================
+        # FACE NOT DETECTED
+        # ====================================================
 
-        generate_report(
+        if result_image is None:
 
-            filename,
+            st.error(
+                "No face detected. Please take another photo."
+            )
 
-            patient_id,
+        else:
 
-            smile,
+            # Convert BGR to RGB for Streamlit
+            display_image = cv2.cvtColor(
+                result_image,
+                cv2.COLOR_BGR2RGB
+            )
 
-            face_symmetry
-        )
+            # =================================================
+            # DISPLAY ANALYZED IMAGE
+            # =================================================
 
-        st.success(
-            "PDF report generated successfully."
-        )
+            st.subheader(
+                "Face Landmark Analysis"
+            )
 
-        with open(
-            filename,
-            "rb"
-        ) as pdf_file:
+            st.image(
+                display_image,
+                caption="Detected facial landmarks",
+                use_container_width=True
+            )
+
+            # =================================================
+            # DISPLAY RESULTS
+            # =================================================
+
+            st.subheader(
+                "📊 Smile Asymmetry Results"
+            )
+
+            asymmetry = analysis[
+                "asymmetry"
+            ]
+
+            dominant_side = analysis[
+                "dominant_side"
+            ]
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+
+                st.metric(
+                    "Smile Asymmetry",
+                    f"{asymmetry:.2f}%"
+                )
+
+            with col2:
+
+                st.metric(
+                    "Dominant Side",
+                    dominant_side
+                )
+
+            # =================================================
+            # SIMPLE INTERPRETATION
+            # =================================================
+
+            if asymmetry < 5:
+
+                st.success(
+                    "The measured smile geometry appears relatively balanced."
+                )
+
+            elif asymmetry < 15:
+
+                st.warning(
+                    "A mild geometric difference was detected "
+                    "between the two sides of the smile."
+                )
+
+            else:
+
+                st.error(
+                    "A noticeable geometric difference was detected. "
+                    "This result is not a medical diagnosis."
+                )
+
+            # =================================================
+            # GENERATE REPORT
+            # =================================================
+
+            st.subheader(
+                "📄 Generate Report"
+            )
+
+            pdf_file = generate_pdf(
+                asymmetry,
+                dominant_side
+            )
 
             st.download_button(
-
-                label="Download PDF Report",
-
+                label="⬇️ Download PDF Report",
                 data=pdf_file,
-
-                file_name=(
-                    f"SmileInsight_{patient_id}.pdf"
-                ),
-
+                file_name="SmileInsight_Report.pdf",
                 mime="application/pdf"
             )
